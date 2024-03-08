@@ -23,6 +23,15 @@ import time
 #해결 방안 예시:  Chem.MolToPDBFile(mol, f'{tmp_path}/new_aa.pdb', flavor=1&2&4&16&32)
 #                mol = Chem.MolFromPDBFile(f'{tmp_path}/aa.pdb', removeHs=False, flavor=1&2&4&16&32)
 
+
+#2024-03-08
+#kekulization 추가
+#RDKit Mol을 kekulize한다.
+#Mol2 파일을 읽고, aromatic bond를 찾는다.
+#atom.PDBResidueInfo().GetSerialNumber()를 통해 같은 원자를 Mol 객체와 Mol2파일에서 찾는다.
+#찾은 원자를 토대로 Mol2 파일의 bond order를 변경한다.
+
+
 def get_atom_name(name):
     return ' ' + name + ' '*(3-len(name))
 
@@ -41,6 +50,7 @@ def obabel_smi_mol2(smi, molname, mol2_dest):
         return
     Chem.MolToPDBFile(mol, f'{tmp_path}/new_aa.pdb', flavor=flavor)
     os.system(f'obabel -ipdb "{tmp_path}/new_aa.pdb" -omol2 -O {mol2_dest} --title {molname}')
+    kekulize_pdbbonds(mol2_dest, mol)
 
 def rdkit_smi_mol2(smi, molname, mol2_dest):
     flavor = 1&2&4&16&32
@@ -59,7 +69,7 @@ def rdkit_smi_mol2(smi, molname, mol2_dest):
     os.system(f'obabel -ipdb "{tmp_path}/new_aa.pdb" -omol2 -O {mol2_dest} --title {molname}')
 
 def set_residue_info(atom, elem_idxs):
-    elem = ''.join([c for c in atom.GetPDBResidueInfo().GetName() if not c.isdigit() and c != ' ']) #get only char
+    elem = ''.join([c for c in atom.GetPDBResidueInfo().GetName() if not c.isdigit() and c != ' '])[:2] #get only char
     if not elem_idxs.get(f'{elem}'): elem_idxs[f'{elem}'] = 1
     elem_idx = elem_idxs[f'{elem}']
     name = f'{elem}{elem_idx}'
@@ -70,9 +80,12 @@ def set_residue_info(atom, elem_idxs):
 def assign_ids_to_pdbmol(mol):
     smarts = Chem.MolFromSmarts("[OX1-]-[CX3](=[OX1])-[CX4]-[NX4+]") #assume protonated, single OC(=O)(N)C
     anames = ['OXT', 'C', 'O', 'CA', 'N']
-    mat = mol.GetSubstructMatches(smarts)[0]
+    matches = mol.GetSubstructMatches(smarts)
+    if len(matches) > 1:
+        print('warning: multiple skeletons')
+    amino_idxs = [m for m in matches[0]]
 
-    for i, idx in enumerate(mat): #label amino acid skeleton atoms
+    for i, idx in enumerate(amino_idxs): #label amino acid skeleton atoms
         atom = mol.GetAtomWithIdx(idx)
         atom.GetPDBResidueInfo().SetName(get_atom_name(anames[i]))
 
@@ -80,8 +93,7 @@ def assign_ids_to_pdbmol(mol):
     #last atom is N
     #atom = mat[-1] #alreay last atom
     #amino acid skeleton amine-H
-    amino_idxs = [idx for idx in mat]
-    aminoh_idxs = [atom.GetIdx() for atom in atom.GetNeighbors() if atom.GetAtomicNum() == 1]
+    aminoh_idxs = [sub_atom.GetIdx() for sub_atom in atom.GetNeighbors() if sub_atom.GetAtomicNum() == 1]
 
     for idx in aminoh_idxs:
         atom = mol.GetAtomWithIdx(idx)
@@ -94,4 +106,57 @@ def assign_ids_to_pdbmol(mol):
     
     return mol
 
-obabel_smi_mol2(sys.argv[1], sys.argv[2], sys.argv[3])
+def kekulize_pdbbonds(mol2_filename, mol):
+    Chem.Kekulize(mol)
+    with open(mol2_filename, 'r') as f: mol2_lines = f.readlines()
+
+    bondlines = mol2_lines[mol2_lines.index('@<TRIPOS>BOND\n')+1:]
+    arom_sns = get_aromatic_atom_sn(bondlines)
+
+    bos = []
+    for sn1, sn2 in arom_sns:
+        bos.append(get_bo_of_pair(mol, sn1, sn2))
+
+    #overwrite content
+    for i, sns in enumerate(arom_sns):
+        sn1, sn2 = sns
+        idx = get_lineidx_with_sns(bondlines, sn1, sn2)
+        if bos[i] is not None:
+            bondlines[idx] = bondlines[idx].replace('ar', f' {bos[i]}')
+    mol2_lines[mol2_lines.index('@<TRIPOS>BOND\n')+1:] = bondlines
+
+    #save
+    with open(mol2_filename, 'w') as f:
+        f.write(''.join(mol2_lines))
+
+def get_bo_of_pair(mol, sn1, sn2):
+    atom1 = get_atom_with_pdbsn(mol, sn1)
+    atom2 = get_atom_with_pdbsn(mol, sn2)
+    if atom1.GetPDBResidueInfo().GetName().strip() in ['O', 'C', 'OXT'] and atom2.GetPDBResidueInfo().GetName().strip() in ['O', 'C', 'OXT']:
+        return None
+    bond = mol.GetBondBetweenAtoms(atom1.GetIdx(), atom2.GetIdx())
+    if bond.GetBondType() == Chem.BondType.DOUBLE: bo = 2
+    elif bond.GetBondType() == Chem.BondType.SINGLE: bo = 1
+    return bo
+
+def get_atom_with_pdbsn(mol, sn):
+    for atom in mol.GetAtoms():
+        if atom.GetPDBResidueInfo().GetSerialNumber() == int(sn): return atom
+    return None
+
+def get_lineidx_with_sns(bondlines, sn1, sn2):
+    for i, bondline in enumerate(bondlines):
+        words = [word for word in bondline.split(' ') if word != '']
+        if sn1 in words[1:3] and sn2 in words[1:3]:
+            return i
+
+def get_aromatic_atom_sn(bondlines): #serial number
+    l = []
+    for bondline in bondlines:
+        words = [word for word in bondline.split(' ') if word != '']
+        if words[3] == 'ar\n':
+            l.append((words[1], words[2]))
+    return l
+
+if __name__ == "__main__":
+    obabel_smi_mol2(sys.argv[1], sys.argv[2], sys.argv[3])
